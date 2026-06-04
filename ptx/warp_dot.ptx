@@ -1,0 +1,75 @@
+// warp_dot.ptx — Warp-level dot product using shuffle reduction
+// Target: sm_89 (Ada Lovelace)
+//
+// Computes dot product of two vectors using 32 threads per warp.
+// Each lane processes elements [lane_id, lane_id+32, lane_id+64, ...].
+// Partial sums are reduced via shfl.sync butterfly.
+//
+// Register budget: 8 f32 registers per thread for 256-element vectors.
+// .maxnreg 32 keeps register pressure low for high occupancy.
+
+.version 8.0
+.target sm_89
+.address_size 64
+
+.visible .entry warp_dot_f32(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 result_ptr,
+    .param .u32 n
+)
+{
+    .reg .f32   %f<8>;
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<8>;
+    .reg .pred  %p;
+
+    ld.param.u64  %rd0, [a_ptr];       // base of vector A
+    ld.param.u64  %rd1, [b_ptr];       // base of vector B
+    ld.param.u64  %rd2, [result_ptr];  // output
+    ld.param.u32  %r0, [n];            // vector length
+
+    mov.u32       %r1, %laneid;        // lane index (0..31)
+    mov.f32       %f0, 0f00000000;     // accumulator = 0.0
+
+    // Strided load: each lane processes every 32nd element
+    // for (i = laneid; i < n; i += 32)
+    mov.u32       %r2, %r1;            // i = laneid
+ Loop:
+    setp.ge.u32   %p, %r2, %r0;       // i >= n?
+@%p bra Done;
+
+    // Load a[i] and b[i], accumulate a[i]*b[i]
+    cvta.to.global.u64 %rd3, %rd0;
+    cvta.to.global.u64 %rd4, %rd1;
+    ld.global.f32 %f1, [%rd3 + %r2 * 4];
+    ld.global.f32 %f2, [%rd4 + %r2 * 4];
+    fma.rn.f32    %f0, %f1, %f2, %f0;  // acc += a[i]*b[i]
+
+    add.u32       %r2, %r2, 32;        // i += 32
+    bra           Loop;
+ Done:
+
+    // Warp-level butterfly reduction of partial sums
+    shfl.sync.bfly.b32 %f3, %f0, %f0, 16, 0xffffffff;
+    add.f32            %f0, %f0, %f3;
+
+    shfl.sync.bfly.b32 %f3, %f0, %f0, 8, 0xffffffff;
+    add.f32            %f0, %f0, %f3;
+
+    shfl.sync.bfly.b32 %f3, %f0, %f0, 4, 0xffffffff;
+    add.f32            %f0, %f0, %f3;
+
+    shfl.sync.bfly.b32 %f3, %f0, %f0, 2, 0xffffffff;
+    add.f32            %f0, %f0, %f3;
+
+    shfl.sync.bfly.b32 %f3, %f0, %f0, 1, 0xffffffff;
+    add.f32            %f0, %f0, %f3;
+
+    // Lane 0 writes the final result
+    setp.eq.u32   %p, %r1, 0;
+@%p cvta.to.global.u64 %rd5, %rd2;
+@%p st.global.f32 [%rd5], %f0;
+
+    ret;
+}

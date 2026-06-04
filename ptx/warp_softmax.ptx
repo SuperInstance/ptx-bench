@@ -1,0 +1,96 @@
+// warp_softmax.ptx — Warp-level softmax using shuffle primitives
+// Target: sm_89 (Ada Lovelace)
+//
+// Computes softmax over a warp-sized vector (32 elements, one per lane).
+// Three phases:
+//   1. Find max via shuffle reduction
+//   2. Compute exp(x - max) per lane
+//   3. Sum via shuffle reduction, then divide
+//
+// Key optimization: No shared memory, no __syncthreads().
+// Everything in registers with shfl.sync.
+
+.version 8.0
+.target sm_89
+.address_size 64
+
+// Approximate exp using the standard PTX ex2 approximation + bias correction
+// exp(x) ≈ ex2.approx(x * 1.44269504)  (1/ln2)
+// We use a two-step approach for better accuracy.
+
+.visible .entry warp_softmax_f32(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr
+)
+{
+    .reg .f32   %f<16>;
+    .reg .u32   %r<4>;
+    .reg .u64   %rd<4>;
+    .reg .pred  %p;
+
+    ld.param.u64  %rd0, [input_ptr];
+    ld.param.u64  %rd1, [output_ptr];
+
+    mov.u32       %r0, %laneid;
+
+    // Load input value
+    ld.global.f32 %f0, [%rd0 + %r0 * 4];  // x[lane]
+
+    // ---- Phase 1: Find max across warp ----
+    // Butterfly max-reduction
+    mov.f32       %f1, %f0;
+
+    shfl.sync.bfly.b32 %f2, %f1, %f1, 16, 0xffffffff;
+    max.f32            %f1, %f1, %f2;
+
+    shfl.sync.bfly.b32 %f2, %f1, %f1, 8, 0xffffffff;
+    max.f32            %f1, %f1, %f2;
+
+    shfl.sync.bfly.b32 %f2, %f1, %f1, 4, 0xffffffff;
+    max.f32            %f1, %f1, %f2;
+
+    shfl.sync.bfly.b32 %f2, %f1, %f1, 2, 0xffffffff;
+    max.f32            %f1, %f1, %f2;
+
+    shfl.sync.bfly.b32 %f2, %f1, %f1, 1, 0xffffffff;
+    max.f32            %f1, %f1, %f2;
+
+    // %f1 = max_val (broadcast to all lanes)
+
+    // ---- Phase 2: exp(x - max) ----
+    sub.f32       %f3, %f0, %f1;         // x[lane] - max
+
+    // exp approximation: exp(x) = ex2(x * (1/ln2))
+    // 1/ln2 ≈ 1.4426950408889634
+    mul.f32       %f4, %f3, 0f3fb8aa3b;  // 1.44269504 in f32
+    ex2.approx.ftz.f32 %f5, %f4;         // 2^(x/ln2) ≈ exp(x)
+    // Note: for production, use a more precise exp via rcp + log2 decomposition
+
+    // ---- Phase 3: Sum exp values across warp ----
+    mov.f32       %f6, %f5;
+
+    shfl.sync.bfly.b32 %f7, %f6, %f6, 16, 0xffffffff;
+    add.f32            %f6, %f6, %f7;
+
+    shfl.sync.bfly.b32 %f7, %f6, %f6, 8, 0xffffffff;
+    add.f32            %f6, %f6, %f7;
+
+    shfl.sync.bfly.b32 %f7, %f6, %f6, 4, 0xffffffff;
+    add.f32            %f6, %f6, %f7;
+
+    shfl.sync.bfly.b32 %f7, %f6, %f6, 2, 0xffffffff;
+    add.f32            %f6, %f6, %f7;
+
+    shfl.sync.bfly.b32 %f7, %f6, %f6, 1, 0xffffffff;
+    add.f32            %f6, %f6, %f7;
+
+    // %f6 = sum_exp (all lanes have it)
+
+    // Final: softmax[lane] = exp(x[lane] - max) / sum_exp
+    div.rn.f32    %f8, %f5, %f6;
+
+    // Store result
+    st.global.f32 [%rd1 + %r0 * 4], %f8;
+
+    ret;
+}

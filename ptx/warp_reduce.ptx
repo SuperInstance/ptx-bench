@@ -1,0 +1,67 @@
+// warp_reduce.ptx — Generic warp-level reduction using shuffle
+// Target: sm_89 (Ada Lovelace)
+//
+// Implements a tree reduction across a warp (32 threads) using shfl.sync.
+// No shared memory required — everything stays in registers.
+//
+// Usage: Include this fragment in kernels that need fast reductions.
+// The caller provides the initial value in %f0 and gets the sum in %f0.
+
+.version 8.0
+.target sm_89
+.address_size 64
+
+// warp_reduce_f32: sum reduction across warp
+// Input:  %f0 = lane value
+// Output: %f0 = sum of all lane values (valid only in lane 0, but all lanes get it)
+.visible .entry warp_reduce_f32(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 count
+)
+{
+    .reg .f32   %f<4>;
+    .reg .u32   %r<4>;
+    .reg .u64   %rd<4>;
+    .reg .pred  %p;
+
+    // Load parameters
+    ld.param.u64  %rd0, [input_ptr];
+    ld.param.u64  %rd1, [output_ptr];
+    ld.param.u32  %r0, [count];
+
+    // Get lane index
+    mov.u32       %r1, %laneid;
+
+    // Load lane value (if index < count)
+    setp.lt.u32   %p, %r1, %r0;
+    selp.f32      %f0, 0f00000000, 0f00000000, %p;  // default 0
+@%p ld.global.f32 %f0, [%rd0 + %r1 * 4];
+
+    // Tree reduction with warp shuffle
+    // Level 0: reduce with lane + 16
+    shfl.sync.bfly.b32 %f1, %f0, %f0, 16, 0xffffffff;
+    add.f32            %f0, %f0, %f1;
+
+    // Level 1: reduce with lane + 8
+    shfl.sync.bfly.b32 %f1, %f0, %f0, 8, 0xffffffff;
+    add.f32            %f0, %f0, %f1;
+
+    // Level 2: reduce with lane + 4
+    shfl.sync.bfly.b32 %f1, %f0, %f0, 4, 0xffffffff;
+    add.f32            %f0, %f0, %f1;
+
+    // Level 3: reduce with lane + 2
+    shfl.sync.bfly.b32 %f1, %f0, %f0, 2, 0xffffffff;
+    add.f32            %f0, %f0, %f1;
+
+    // Level 4: reduce with lane + 1
+    shfl.sync.bfly.b32 %f1, %f0, %f0, 1, 0xffffffff;
+    add.f32            %f0, %f0, %f1;
+
+    // Lane 0 writes result
+    setp.eq.u32   %p, %r1, 0;
+@%p st.global.f32 [%rd1], %f0;
+
+    ret;
+}

@@ -1,0 +1,182 @@
+// blake2b.ptx — BLAKE2b G-mix function in PTX
+// Target: sm_89 (Ada Lovelace)
+//
+// Implements the core G function of BLAKE2b hashing.
+// This is the hot inner loop — optimizing it at PTX level
+// allows precise scheduling of 64-bit rotations and additions.
+//
+// BLAKE2b G function:
+//   a = a + b + 2*MSG_WORD
+//   d = ror64(d ^ a, 32)
+//   c = c + d
+//   b = ror64(b ^ c, 24)
+//   a = a + b + 2*MSG_WORD
+//   d = ror64(d ^ a, 16)
+//   c = c + d
+//   b = ror64(b ^ c, 63)
+//
+// PTX optimization notes:
+// - Use .reg .u64 for 64-bit state words (v[0..7], m[0..15])
+// - shl/shr pair for rotation (PTX has no direct ror/rol)
+// - .maxnreg 40 to leave room for occupancy
+// - Two loads of message words can be pipelined
+
+.version 8.0
+.target sm_89
+.address_size 64
+
+// blake2b_g: Compute one round of G-mix
+// State: %rd0=a, %rd1=b, %rd2=c, %rd3=d
+// Message words: %rd4=x, %rd5=y
+// Modifies: a, b, c, d in place
+
+.func blake2b_g(
+    .reg .u64 a,
+    .reg .u64 b,
+    .reg .u64 c,
+    .reg .u64 d,
+    .reg .u64 x,
+    .reg .u64 y,
+    .reg .u64 &out_a,
+    .reg .u64 &out_b,
+    .reg .u64 &out_c,
+    .reg .u64 &out_d
+)
+{
+    .reg .u64 %tmp<4>;
+
+    // a = a + b + x
+    add.u64     a, a, b;
+    add.u64     a, a, x;
+
+    // d = ror64(d ^ a, 32)
+    xor.b64     d, d, a;
+    // ror64 by 32: swap high and low 32 bits
+    // shr 32 | shl 32
+    shr.u64     %tmp0, d, 32;
+    shl.b64     %tmp1, d, 32;
+    or.b64      d, %tmp0, %tmp1;
+
+    // c = c + d
+    add.u64     c, c, d;
+
+    // b = ror64(b ^ c, 24)
+    xor.b64     b, b, c;
+    shr.u64     %tmp0, b, 24;
+    shl.b64     %tmp1, b, 40;   // 64-24=40
+    or.b64      b, %tmp0, %tmp1;
+
+    // a = a + b + y
+    add.u64     a, a, b;
+    add.u64     a, a, y;
+
+    // d = ror64(d ^ a, 16)
+    xor.b64     d, d, a;
+    shr.u64     %tmp0, d, 16;
+    shl.b64     %tmp1, d, 48;   // 64-16=48
+    or.b64      d, %tmp0, %tmp1;
+
+    // c = c + d
+    add.u64     c, c, d;
+
+    // b = ror64(b ^ c, 63)
+    xor.b64     b, b, c;
+    shr.u64     %tmp0, b, 63;
+    shl.b64     %tmp1, b, 1;    // 64-63=1
+    or.b64      b, %tmp0, %tmp1;
+
+    st.u64      [out_a], a;
+    st.u64      [out_b], b;
+    st.u64      [out_c], c;
+    st.u64      [out_d], d;
+
+    ret;
+}
+
+.visible .entry blake2b_compress(
+    .param .u64 state_ptr,
+    .param .u64 msg_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n_blocks
+)
+{
+    .reg .u64   %v<8>;
+    .reg .u64   %m<16>;
+    .reg .u64   %rd<8>;
+    .reg .u32   %r<4>;
+    .reg .pred  %p;
+
+    // BLAKE2b IV constants
+    // iv0=0x6a09e667f3bcc908, iv1=0xbb67ae8584caa73b, etc.
+    mov.u64     %v0, 0x6a09e667f3bcc908;
+    mov.u64     %v1, 0xbb67ae8584caa73b;
+    mov.u64     %v2, 0x3c6ef372fe94f82b;
+    mov.u64     %v3, 0xa54ff53a5f1d36f1;
+    mov.u64     %v4, 0x510e527fade682d1;
+    mov.u64     %v5, 0x9b05688c2b3e6c1f;
+    mov.u64     %v6, 0x1f83d9abfb41bd6b;
+    mov.u64     %v7, 0x5be0cd19137e2179;
+
+    // XOR state into v[0..3], counter into v[4..5], etc.
+    ld.param.u64 %rd0, [state_ptr];
+    ld.global.u64 %v0, [%rd0];
+    ld.global.u64 %v1, [%rd0 + 8];
+    ld.global.u64 %v2, [%rd0 + 16];
+    ld.global.u64 %v3, [%rd0 + 24];
+    // (simplified — full implementation loads all state words)
+
+    // Load 16 message words
+    ld.param.u64 %rd1, [msg_ptr];
+    // Each thread processes its own message block
+    mov.u32     %r0, %ctaid.x;   // block index
+
+    // Load message block (16 × u64 = 128 bytes)
+    ld.global.u64 %m0,  [%rd1];
+    ld.global.u64 %m1,  [%rd1 + 8];
+    ld.global.u64 %m2,  [%rd1 + 16];
+    ld.global.u64 %m3,  [%rd1 + 24];
+    ld.global.u64 %m4,  [%rd1 + 32];
+    ld.global.u64 %m5,  [%rd1 + 40];
+    ld.global.u64 %m6,  [%rd1 + 48];
+    ld.global.u64 %m7,  [%rd1 + 56];
+    ld.global.u64 %m8,  [%rd1 + 64];
+    ld.global.u64 %m9,  [%rd1 + 72];
+    ld.global.u64 %m10, [%rd1 + 80];
+    ld.global.u64 %m11, [%rd1 + 88];
+    ld.global.u64 %m12, [%rd1 + 96];
+    ld.global.u64 %m13, [%rd1 + 104];
+    ld.global.u64 %m14, [%rd1 + 112];
+    ld.global.u64 %m15, [%rd1 + 120];
+
+    // 12 rounds of G mixing (BLAKE2b uses 12 rounds)
+    // Each round applies 8 G calls with message word scheduling
+    // Round sigma: {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15} for round 0, etc.
+    // This is a skeleton — full implementation has all 12 rounds × 8 G-calls
+
+    // Round 0 example (sigma_0):
+    // G(v0,v4,v8,v12, m0,m1)
+    // G(v1,v5,v9,v13, m2,m3)
+    // G(v2,v6,v10,v14, m4,m5)
+    // G(v3,v7,v11,v15, m6,m7)
+    // G(v0,v5,v10,v15, m8,m9)
+    // G(v1,v6,v11,v12, m10,m11)
+    // G(v2,v7,v8,v13,  m12,m13)
+    // G(v3,v4,v9,v14,  m14,m15)
+
+    // ... (12 rounds of 8 G calls each)
+
+    // Finalization: XOR v[0..3] ^ v[4..7] ^ v[8..11] ^ v[12..15]
+    xor.b64     %v0, %v0, %v4;
+    xor.b64     %v1, %v1, %v5;
+    xor.b64     %v2, %v2, %v6;
+    xor.b64     %v3, %v3, %v7;
+
+    // Store result
+    ld.param.u64 %rd2, [out_ptr];
+    st.global.u64 [%rd2],      %v0;
+    st.global.u64 [%rd2 + 8],  %v1;
+    st.global.u64 [%rd2 + 16], %v2;
+    st.global.u64 [%rd2 + 24], %v3;
+
+    ret;
+}
